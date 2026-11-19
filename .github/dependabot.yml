@@ -4,7 +4,29 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      pip:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # mcp 2.x migrated to httpx2, causing TypeError: unsupported operand type(s) for +: 'float' and 'Timeout' in anyio fail_after and breaking x402 / httpx compatibility
+      - dependency-name: "mcp"
+        update-types: ["version-update:semver-major"]
+      # fastmcp 4.x requires mcp >= 2.0 and httpx2, breaking x402 compatibility
+      - dependency-name: "fastmcp"
+        update-types: ["version-update:semver-major"]
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"

@@ -4,6 +4,17 @@ All notable changes to `ai-economy-sdk` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-11-19
+
+### Added
+- Project URLs (`Homepage`, `Documentation`, `Repository`, `Issues`, `Changelog`), PyPI classifiers, and dev optional dependencies (`pytest`, `pytest-asyncio`, `ruff`, `build`, `twine`) in `pyproject.toml`.
+- Self-contained LocalNet test infrastructure in `tests/conftest.py` with dynamic KMD dispenser funding, ephemeral account creation, and dynamic asset generation, removing external file and private path dependencies.
+- Public repository documentation and metadata: comprehensive `README.md` with working FastMCP quickstart, `AGENTS.md` coding agent specification, `ruff.toml`, `.editorconfig`, GitHub Actions CI pipeline, and Dependabot weekly updates with PR grouping.
+
+### Changed
+- Code formatted with Ruff (`ruff check` and `ruff format`) for standard import ordering and styling without behavioral changes.
+- Dependency policy: Kept stable ranges `fastmcp>=3.4,<4` and `mcp>=1.29,<2`; major versions `mcp 2.x` and `fastmcp 4.x` are pinned/ignored in Dependabot configuration due to upstream `httpx2` breaking changes affecting `x402` compatibility.
+
 ## [0.4.0] - 2026-11-18
 
 ### Added
