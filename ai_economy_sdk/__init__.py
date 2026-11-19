@@ -27,6 +27,7 @@ MAINNET : Canonical CAIP-2 string for Algorand MainNet.
 TESTNET : Canonical CAIP-2 string for Algorand TestNet.
 IDENTITY_HEADERS : Tuple of legacy identity header names.
 AIEconomyError : Base class of every exception the SDK raises (see ``ai_economy_sdk.exceptions``).
+SpendLimitExceededError : Raised by ``paid_mcp_session`` when the buyer's spend controls refuse a payment.
 __version__ : Installed package version.
 
 Logging
@@ -56,6 +57,7 @@ from .exceptions import (
     PaymentRequiredError,
     PaymentVerificationError,
     SettlementError,
+    SpendLimitExceededError,
     UnknownNetworkError,
 )
 from .gate import PaymentGate, SettleOnSuccessMiddleware
@@ -120,6 +122,7 @@ __all__ = [
     "PaymentVerificationError",
     "PaymentRequiredError",
     "SettlementError",
+    "SpendLimitExceededError",
     "ServerSigner",
     "ChainLookup",
     "Prices",

@@ -4,6 +4,14 @@ All notable changes to `ai-economy-sdk` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-11-19
+
+### Fixed
+- When the buyer's own spend controls refused a payment inside `paid_mcp_session`, the caller got an `ExceptionGroup` wrapping x402's `PaymentError` (cause `NoMatchingRequirementsError`), so `except AIEconomyError` missed it. The refusal now surfaces as `SpendLimitExceededError`, with the x402 error as `__cause__`. Other errors, and groups that contain anything besides the refusal, propagate unchanged.
+
+### Added
+- `SpendLimitExceededError(AIEconomyError)`, exported from the package and documented in `ai_economy_sdk.exceptions`. Its message includes the amount and asset the server asked for.
+
 ## [0.5.0] - 2026-11-19
 
 ### Security

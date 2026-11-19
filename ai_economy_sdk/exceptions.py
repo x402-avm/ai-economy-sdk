@@ -13,7 +13,8 @@ Hierarchy::
     │   └── AlgodClientRequiredError (also RuntimeError)
     ├── PaymentVerificationError (RuntimeError)
     ├── PaymentRequiredError (fastmcp ToolError)
-    └── SettlementError (fastmcp ToolError)
+    ├── SettlementError (fastmcp ToolError)
+    └── SpendLimitExceededError
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ __all__ = [
     "PaymentVerificationError",
     "PaymentRequiredError",
     "SettlementError",
+    "SpendLimitExceededError",
 ]
 
 
@@ -74,4 +76,15 @@ class SettlementError(AIEconomyError, ToolError):
 
     The tool's output is withheld from the caller and the payment reservation is
     released, so the buyer is not charged.
+    """
+
+
+class SpendLimitExceededError(AIEconomyError):
+    """The buyer's own spend controls refused a payment, so nothing was signed or sent.
+
+    Raised by :func:`ai_economy_sdk.paid_mcp_session` when a server asks for more than the
+    client's ``spend_controls`` allow (the default caps a payment at 1 ALGO or 1 USDC), or
+    for an asset they do not allow. No transaction is built and no funds move. The original
+    x402 error is kept as ``__cause__``; the message includes the offered amount and asset
+    when the server's offers are known.
     """

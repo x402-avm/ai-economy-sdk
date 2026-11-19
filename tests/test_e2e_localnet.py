@@ -6,6 +6,7 @@ on both HTTP transports (Streamable HTTP at /mcp and legacy SSE at /sse).
 
 import asyncio
 import socket
+import sys
 import threading
 import time
 
@@ -18,6 +19,9 @@ from fastmcp import FastMCP
 from ai_economy_sdk import DefaultAvmSigner, PaymentGate
 from ai_economy_sdk.chain import ChainReader
 from ai_economy_sdk.client import paid_mcp_session
+
+if sys.version_info < (3, 11):
+    from exceptiongroup import BaseExceptionGroup, ExceptionGroup  # noqa: F401
 
 pytestmark = pytest.mark.localnet
 PRICE = 12_345
@@ -174,3 +178,26 @@ def test_unpaid_plain_client_is_refused(env):
             },
         )
         assert r.status_code == 402
+
+
+def test_spend_cap_refusal_raises_spend_limit_error_and_moves_no_funds(env):
+    from ai_economy_sdk import AIEconomyError, SpendLimitExceededError
+
+    cfg = env["cfg"]
+    pay_to = cfg["accounts"]["server"]["address"]
+    buyer = cfg["accounts"]["client2"]["address"]
+    low_cap = {
+        "allowed_assets": [
+            {"network": cfg["network"], "asset": "0", "max_amount_per_payment": str(PRICE - 1)}
+        ]
+    }
+    server_before = env["algod"].account_info(pay_to)["amount"]
+    buyer_before = env["algod"].account_info(buyer)["amount"]
+    with pytest.raises(SpendLimitExceededError) as ei:
+        asyncio.run(_call(env["url"], "client2", "too dear", spend_controls=low_cap))
+    assert isinstance(ei.value, AIEconomyError)
+    assert not isinstance(ei.value, BaseExceptionGroup)
+    assert str(PRICE) in str(ei.value)
+    assert ei.value.__cause__ is not None
+    assert env["algod"].account_info(pay_to)["amount"] == server_before
+    assert env["algod"].account_info(buyer)["amount"] == buyer_before

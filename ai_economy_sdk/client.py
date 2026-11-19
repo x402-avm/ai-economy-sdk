@@ -9,10 +9,12 @@ transaction (or 2-txn fee-payer group), and retries the request with the signed 
 from __future__ import annotations
 
 import contextlib
+import sys
 from collections.abc import AsyncGenerator
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
+import anyio
 import httpx
 import mcp.client.sse
 from algosdk.v2client import algod
@@ -20,13 +22,17 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from x402 import x402Client
 from x402.http.clients.httpx import x402HttpxClient
+from x402.schemas.errors import NoMatchingRequirementsError
 from x402_algorand.exact.register import register_exact_avm_client
 
-from .exceptions import ConfigurationError
+from .exceptions import ConfigurationError, SpendLimitExceededError
 from .identity import _sign_legacy_identity
 from .network import endpoints_for, resolve_network
 from .signer import DefaultAvmSigner
 from .types import SpendControlsArg
+
+if sys.version_info < (3, 11):
+    from exceptiongroup import BaseExceptionGroup
 
 ClientTransport = Literal["streamable-http", "sse"]
 
@@ -35,6 +41,60 @@ def _infer_transport(url: str) -> ClientTransport:
     """Streamable HTTP for URLs whose path ends in ``/mcp``; SSE otherwise (the 0.4 behaviour)."""
     path = urlsplit(url).path.rstrip("/")
     return "streamable-http" if path.endswith("/mcp") else "sse"
+
+
+def _leaf_exceptions(exc: BaseException) -> list[BaseException]:
+    """Flatten (possibly nested) exception groups into their leaf exceptions."""
+    if isinstance(exc, BaseExceptionGroup):
+        return [leaf for sub in exc.exceptions for leaf in _leaf_exceptions(sub)]
+    return [exc]
+
+
+def _spend_refusal_cause(exc: BaseException) -> NoMatchingRequirementsError | None:
+    """Return x402's spend-control refusal if ``exc`` is one (directly or as ``__cause__``)."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, NoMatchingRequirementsError) and "spend_controls" in str(cur):
+            return cur
+        cur = cur.__cause__
+    return None
+
+
+def _describe_offers(payment_required: Any) -> str:
+    """Summarise the server's offers as ``amount of asset`` for an error message."""
+    try:
+        offers = [f"{a.amount} of asset {a.asset} on {a.network}" for a in payment_required.accepts]
+    except AttributeError:
+        return ""
+    return "; ".join(offers)
+
+
+def _translate_spend_refusal(
+    exc: BaseException, payment_required: Any = None
+) -> SpendLimitExceededError | None:
+    """Turn a spend-control refusal into :class:`SpendLimitExceededError`, or return None.
+
+    ``exc`` may be the refusal itself or an ``ExceptionGroup`` (anyio task groups wrap errors
+    raised inside them, possibly several levels deep). Only a refusal that is the sole leaf
+    error is translated: if any other error is present the caller must re-raise ``exc``
+    unchanged so nothing unrelated is hidden.
+    """
+    leaves = _leaf_exceptions(exc)
+    causes = [_spend_refusal_cause(leaf) for leaf in leaves]
+    if not leaves or any(c is None for c in causes):
+        return None
+    cause = causes[0]
+    assert cause is not None
+    offered = _describe_offers(payment_required) if payment_required is not None else ""
+    msg = "payment refused by this client's spend_controls; nothing was signed or sent"
+    if offered:
+        msg += f" (server asked for {offered})"
+    msg += f". {cause}"
+    err = SpendLimitExceededError(msg)
+    err.__cause__ = cause
+    return err
 
 
 @contextlib.asynccontextmanager
@@ -116,6 +176,10 @@ async def paid_mcp_session(
     ------
     ConfigurationError
         If ``transport`` is not ``"streamable-http"`` or ``"sse"``.
+    SpendLimitExceededError
+        If a tool call needs a payment that ``spend_controls`` forbid (amount above the cap,
+        or an asset that is not allowed). Nothing is signed and no funds move. The x402 error
+        is its ``__cause__``. Other errors propagate unchanged.
 
     Examples
     --------
@@ -153,6 +217,24 @@ async def paid_mcp_session(
     x402_client = x402Client()
     if spend_controls is not None:
         x402_client.set_spend_controls(spend_controls)
+    offers: list[Any] = []
+    refusals: list[BaseException] = []
+    scope = anyio.CancelScope()
+    _create_payload = x402_client.create_payment_payload
+
+    async def _recording_create_payload(payment_required: Any, *a: Any, **kw: Any) -> Any:
+        offers.append(payment_required)
+        try:
+            return await _create_payload(payment_required, *a, **kw)
+        except Exception as e:
+            if _spend_refusal_cause(e) is not None and not refusals:
+                # Over SSE the MCP client swallows errors raised while posting a request, so the
+                # caller would wait forever for a reply. Record the refusal and cancel the session.
+                refusals.append(e)
+                scope.cancel()
+            raise
+
+    x402_client.create_payment_payload = _recording_create_payload  # type: ignore[method-assign]
     signer = DefaultAvmSigner(private_key, algod_client=algod_client)
     register_exact_avm_client(
         x402_client,
@@ -188,15 +270,35 @@ async def paid_mcp_session(
             event_hooks=hooks,
         )
 
-    if transport == "streamable-http":
-        async with factory() as http_client:
-            async with streamable_http_client(sse_url, http_client=http_client) as (r, w, _):
-                async with ClientSession(r, w) as s:
-                    await s.initialize()
-                    yield s
-        return
+    def _refusal_error(exc: BaseException) -> SpendLimitExceededError | None:
+        return _translate_spend_refusal(exc, offers[-1] if offers else None)
 
-    async with mcp.client.sse.sse_client(sse_url, httpx_client_factory=factory) as (r, w):
-        async with ClientSession(r, w) as s:
-            await s.initialize()
-            yield s
+    try:
+        with scope:
+            if transport == "streamable-http":
+                async with factory() as http_client:
+                    async with streamable_http_client(sse_url, http_client=http_client) as (
+                        r,
+                        w,
+                        _,
+                    ):
+                        async with ClientSession(r, w) as s:
+                            await s.initialize()
+                            yield s
+            else:
+                async with mcp.client.sse.sse_client(sse_url, httpx_client_factory=factory) as (
+                    r,
+                    w,
+                ):
+                    async with ClientSession(r, w) as s:
+                        await s.initialize()
+                        yield s
+    except Exception as exc:
+        translated = _refusal_error(exc)
+        if translated is None:
+            raise
+        raise translated from translated.__cause__
+    if refusals and scope.cancelled_caught:
+        translated = _refusal_error(refusals[0])
+        if translated is not None:
+            raise translated from translated.__cause__
