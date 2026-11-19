@@ -1,6 +1,11 @@
 """Contract: ai_economy_sdk.chain.ChainReader - indexer queries for subscriptions and usage discounts."""
 
+import logging
 import time
+import urllib.error
+
+import pytest
+from algosdk.error import IndexerHTTPError
 
 from ai_economy_sdk.chain import ChainReader
 
@@ -66,12 +71,42 @@ def test_usage_asa_filters_asset():
     assert fake.calls[0]["txn_type"] == "axfer" and fake.calls[0]["asset_id"] == 1003
 
 
-def test_usage_indexer_error_returns_zero():
-    class Boom:
-        def search_transactions(self, **kw):
-            raise RuntimeError("down")
+class Boom:
+    """Indexer that fails like a real one: HTTP error or connection refused."""
 
-    assert ChainReader(indexer=Boom()).past_usage(USER, PAY_TO, 0, now=NOW) == 0
+    def __init__(self, exc):
+        self.exc = exc
+
+    def search_transactions(self, **kw):
+        raise self.exc
+
+    def account_info(self, address):
+        raise self.exc
+
+
+DOWN = [IndexerHTTPError("503 down"), urllib.error.URLError("connection refused")]
+
+
+@pytest.mark.parametrize("exc", DOWN)
+def test_usage_indexer_error_returns_zero_and_logs(exc, caplog):
+    with caplog.at_level(logging.WARNING, logger="ai_economy_sdk"):
+        assert ChainReader(indexer=Boom(exc)).past_usage(USER, PAY_TO, 0, now=NOW) == 0
+    assert "past_usage lookup" in caplog.text
+
+
+@pytest.mark.parametrize("exc", DOWN)
+def test_subscription_and_pass_lookup_errors_deny_and_log(exc, caplog):
+    r = ChainReader(indexer=Boom(exc))
+    with caplog.at_level(logging.WARNING, logger="ai_economy_sdk"):
+        assert r.has_active_subscription(USER, 77, now=NOW) is False
+        assert r.active_passes(USER, PAY_TO, 0, {"svc": 1}, now=NOW) == []
+    assert "subscription lookup" in caplog.text
+    assert "pass lookup" in caplog.text
+
+
+def test_programming_errors_are_not_swallowed():
+    with pytest.raises(ZeroDivisionError):
+        ChainReader(indexer=Boom(ZeroDivisionError())).past_usage(USER, PAY_TO, 0, now=NOW)
 
 
 def test_subscription_requires_balance_and_recent_receipt():

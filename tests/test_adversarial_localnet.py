@@ -90,7 +90,9 @@ def server_env():
 
     port = _free_port()
     server = uvicorn.Server(
-        uvicorn.Config(gate.wrap(m), host="127.0.0.1", port=port, log_level="error")
+        uvicorn.Config(
+            gate.wrap(m, transport="sse"), host="127.0.0.1", port=port, log_level="error"
+        )
     )
     t = threading.Thread(target=server.run, daemon=True)
     t.start()
@@ -518,7 +520,7 @@ def test_attack_10a_replay_after_settle():
                 subscription_asset_id=cfg["subscription_asset_id"],
                 replay_db=shared_replay_db,
             )
-            return gate.wrap(m)
+            return gate.wrap(m, transport="sse")
 
         p1 = _free_port()
         p2 = _free_port()
@@ -652,7 +654,7 @@ def test_attack_10b_concurrent_replay_shared_db():
                 subscription_asset_id=cfg["subscription_asset_id"],
                 replay_db=shared_replay_db,
             )
-            return gate.wrap(m)
+            return gate.wrap(m, transport="sse")
 
         p1 = _free_port()
         p2 = _free_port()
@@ -792,7 +794,7 @@ def test_attack_10c_concurrent_replay_separate_db():
                 subscription_asset_id=cfg["subscription_asset_id"],
                 replay_db=db_path,
             )
-            return gate.wrap(m)
+            return gate.wrap(m, transport="sse")
 
         p1 = _free_port()
         p2 = _free_port()

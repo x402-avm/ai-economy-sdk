@@ -1,6 +1,7 @@
 """End-to-end on AlgoKit LocalNet (run: LOCALNET=1 pytest -m localnet).
 
-Proves the full loop: gated FastMCP server -> 402 -> client pays on-chain -> tool result -> funds arrived.
+Proves the full loop: gated FastMCP server -> 402 -> client pays on-chain -> tool result -> funds arrived,
+on both HTTP transports (Streamable HTTP at /mcp and legacy SSE at /sse).
 """
 
 import asyncio
@@ -31,8 +32,9 @@ def _free_port():
     return p
 
 
-@pytest.fixture(scope="module")
-def env():
+@pytest.fixture(scope="module", params=["streamable-http", "sse"])
+def env(request):
+    transport = request.param
     cfg = get_localnet_context()
     algod_client = algod.AlgodClient(cfg["algod_token"], cfg["algod_url"])
     server_pk = cfg["accounts"]["server"]["private_key"]
@@ -57,7 +59,9 @@ def env():
     )
     port = _free_port()
     server = uvicorn.Server(
-        uvicorn.Config(gate.wrap(m), host="127.0.0.1", port=port, log_level="warning")
+        uvicorn.Config(
+            gate.wrap(m, transport=transport), host="127.0.0.1", port=port, log_level="warning"
+        )
     )
     t = threading.Thread(target=server.run, daemon=True)
     t.start()
@@ -68,7 +72,14 @@ def env():
             break
         except OSError:
             time.sleep(0.1)
-    yield {"url": f"http://127.0.0.1:{port}/sse", "algod": algod_client, "gate": gate, "cfg": cfg}
+    path = "/mcp" if transport == "streamable-http" else "/sse"
+    yield {
+        "url": f"http://127.0.0.1:{port}{path}",
+        "transport": transport,
+        "algod": algod_client,
+        "gate": gate,
+        "cfg": cfg,
+    }
     server.should_exit = True
     t.join(5)
 
@@ -129,6 +140,23 @@ def test_spend_controls_unlimited_max_amount_pays(env):
 
 def test_unpaid_plain_client_is_refused(env):
     import httpx
+
+    call = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"text": "x"}},
+    }
+    if env["transport"] == "streamable-http":
+        r = httpx.post(
+            env["url"],
+            json=call,
+            headers={"accept": "application/json, text/event-stream"},
+            timeout=10,
+        )
+        assert r.status_code == 402
+        assert r.headers.get("payment-required")
+        return
 
     with httpx.Client(timeout=10) as c, c.stream("GET", env["url"]) as sse:
         endpoint = None

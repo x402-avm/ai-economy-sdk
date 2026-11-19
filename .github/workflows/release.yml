@@ -1,0 +1,89 @@
+name: Release
+
+# DISABLED: this workflow runs only when started by hand (Actions > Release > Run workflow).
+#
+# One-time setup before the first run:
+#   1. On PyPI, open the ai-economy-sdk project > Settings > Publishing and add a
+#      "trusted publisher" for GitHub Actions with owner `x402-avm`, repository
+#      `ai-economy-sdk`, workflow `release.yml` and environment `pypi`.
+#   2. In this repository, create the `pypi` environment (Settings > Environments),
+#      ideally with required reviewers.
+# No PyPI API token is stored anywhere: the job proves its identity with a short-lived
+# OIDC token (`id-token: write`).
+#
+# To publish automatically when a version tag is pushed, replace the `on:` block with:
+#
+# on:
+#   push:
+#     tags: ["v*"]
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+      - name: Build sdist and wheel
+        run: python -m build
+      - name: Check distributions
+        run: |
+          twine check --strict dist/*
+          python -m zipfile -l dist/*.whl | grep -q "ai_economy_sdk/py.typed"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/ai-economy-sdk
+    permissions:
+      id-token: write # PyPI trusted publishing (OIDC) and attestations
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish with trusted publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: true
+
+  github-release:
+    name: Create GitHub Release
+    needs: publish-pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Create release from the package version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          gh release create "v${version}" dist/* \
+            --title "v${version}" \
+            --notes "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md) for the changes in this release." \
+            --target "${GITHUB_SHA}"

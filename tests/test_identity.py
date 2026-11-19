@@ -1,10 +1,23 @@
 """Contract: ai_economy_sdk.identity - proof that the caller owns an Algorand address (no payment needed)."""
 
+import pytest
 from algosdk import account
 
-from ai_economy_sdk.identity import IDENTITY_HEADERS, sign_identity, verify_identity
+from ai_economy_sdk import identity
+from ai_economy_sdk.identity import IDENTITY_HEADERS, verify_identity
+
+# The legacy signer is deprecated; these tests exercise its header format and the
+# server-side verification, which stays supported, through the non-warning helper.
+sign_identity = identity._sign_legacy_identity
 
 PK, ADDR = account.generate_account()
+
+
+def test_sign_identity_is_deprecated_but_still_works():
+    with pytest.deprecated_call(match="sign_identity_txn"):
+        h = identity.sign_identity(PK, now=1_000_000)
+    assert h == sign_identity(PK, now=1_000_000)
+    assert verify_identity(h, now=1_000_000) == ADDR
 
 
 def test_headers_names():

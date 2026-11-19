@@ -13,7 +13,9 @@ Supports two signature formats:
 
 import base64
 import copy
+import logging
 import time
+import warnings
 from collections.abc import Mapping
 from typing import Any
 
@@ -22,9 +24,26 @@ import algosdk.atomic_transaction_composer
 import algosdk.encoding
 import algosdk.transaction
 import algosdk.util
+import nacl.exceptions
 import nacl.signing
 
+logger = logging.getLogger("ai_economy_sdk")
+
 IDENTITY_HEADERS = ("x-sender-address", "x-sender-timestamp", "x-sender-signature")
+
+# Errors that decoding or verifying an untrusted X-Identity-Txn value can raise
+# (found by fuzzing): malformed base64/msgpack/UTF-8 (ValueError and subclasses),
+# unexpected msgpack shapes inside algosdk (TypeError, KeyError, IndexError,
+# AttributeError, UnboundLocalError) and a bad Ed25519 signature (CryptoError).
+_MALFORMED_PROOF_ERRORS: tuple[type[BaseException], ...] = (
+    ValueError,
+    TypeError,
+    KeyError,
+    IndexError,
+    AttributeError,
+    UnboundLocalError,
+    nacl.exceptions.CryptoError,
+)
 
 
 def make_identity_txn(
@@ -294,7 +313,8 @@ def verify_identity_txn(
         vk.verify(txn.bytes_to_sign(), raw_sig)
 
         return sender
-    except Exception:
+    except _MALFORMED_PROOF_ERRORS as e:
+        logger.debug("rejected X-Identity-Txn: %s: %s", type(e).__name__, e)
         return None
 
 
@@ -323,12 +343,22 @@ def sign_identity(private_key: str, now: int | None = None) -> dict[str, str]:
     sign_identity_txn : Preferred modern transaction-based proof.
     verify_identity : Validates both modern and legacy identity headers.
 
+    Notes
+    -----
+    .. deprecated:: 0.5.0
+       Use :func:`sign_identity_txn`, whose proof is bound to one network's genesis
+       hash. ``sign_identity`` keeps working and servers keep accepting its headers;
+       it emits a ``DeprecationWarning`` and will be removed in a future major release.
+
     Examples
     --------
+    >>> import warnings
     >>> from algosdk import account
     >>> from ai_economy_sdk.identity import sign_identity
     >>> sk, addr = account.generate_account()
-    >>> hdrs = sign_identity(sk, now=1700000000)
+    >>> with warnings.catch_warnings():
+    ...     warnings.simplefilter("ignore", DeprecationWarning)
+    ...     hdrs = sign_identity(sk, now=1700000000)
     >>> hdrs["x-sender-address"] == addr
     True
     >>> hdrs["x-sender-timestamp"]
@@ -336,6 +366,17 @@ def sign_identity(private_key: str, now: int | None = None) -> dict[str, str]:
     >>> bool(hdrs["x-sender-signature"])
     True
     """
+    warnings.warn(
+        "sign_identity() is deprecated; use sign_identity_txn(private_key, genesis_hash_b64), "
+        "which binds the proof to one network",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _sign_legacy_identity(private_key, now)
+
+
+def _sign_legacy_identity(private_key: str, now: int | None = None) -> dict[str, str]:
+    """Legacy ``x-sender-*`` headers, without the deprecation warning (used by the client)."""
     address = algosdk.account.address_from_private_key(private_key)
     ts = int(now if now is not None else time.time())
     message = f"x402-identity:{address}:{ts}".encode()
@@ -385,10 +426,11 @@ def verify_identity(
     Examples
     --------
     >>> from algosdk import account
-    >>> from ai_economy_sdk.identity import sign_identity, verify_identity
+    >>> from ai_economy_sdk.identity import sign_identity_txn, verify_identity
     >>> sk, addr = account.generate_account()
-    >>> hdrs = sign_identity(sk)
-    >>> verify_identity(hdrs) == addr
+    >>> gh = "wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8="
+    >>> hdrs = sign_identity_txn(sk, gh)
+    >>> verify_identity(hdrs, genesis_hash_b64=gh) == addr
     True
     >>> verify_identity({}) is None
     True
@@ -431,9 +473,11 @@ def verify_identity(
 
     message = f"x402-identity:{addr}:{ts}".encode()
     try:
-        if not algosdk.util.verify_bytes(message, sig, addr):
-            return None
-    except Exception:
+        ok = algosdk.util.verify_bytes(message, sig, addr)
+    except (ValueError, TypeError, nacl.exceptions.CryptoError):
+        ok = False  # older py-algorand-sdk releases raise instead of returning False
+    if not ok:
+        logger.debug("rejected legacy identity headers for %s: bad signature", addr)
         return None
 
     return addr

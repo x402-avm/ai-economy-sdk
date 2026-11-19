@@ -26,16 +26,39 @@ usdc_asset_id : Look up Circle USDC ASA ID for a network.
 MAINNET : Canonical CAIP-2 string for Algorand MainNet.
 TESTNET : Canonical CAIP-2 string for Algorand TestNet.
 IDENTITY_HEADERS : Tuple of legacy identity header names.
+AIEconomyError : Base class of every exception the SDK raises (see ``ai_economy_sdk.exceptions``).
+__version__ : Installed package version.
+
+Logging
+-------
+The SDK logs to the ``"ai_economy_sdk"`` logger: payment refusals, settlement failures
+and failed chain lookups at WARNING, routine payment decisions at INFO/DEBUG.
 """
 
+from __future__ import annotations
+
+import inspect
+import logging
+import warnings
 from collections.abc import Callable
-from typing import Any
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _dist_version
+from typing import Any, TypeVar
 
 from fastmcp import FastMCP
 
 from .chain import PASS_NOTE_PREFIX, ChainReader
 from .client import paid_mcp_session
-from .gate import PaymentGate
+from .exceptions import (
+    AIEconomyError,
+    AlgodClientRequiredError,
+    ConfigurationError,
+    PaymentRequiredError,
+    PaymentVerificationError,
+    SettlementError,
+    UnknownNetworkError,
+)
+from .gate import PaymentGate, SettleOnSuccessMiddleware
 from .identity import (
     IDENTITY_HEADERS,
     make_identity_txn,
@@ -56,10 +79,21 @@ from .network import (
     usdc_asset_id,
 )
 from .signer import DefaultAvmSigner
+from .types import ChainLookup, Prices, ServerSigner, ToolPriceFunction, Transport
+
+try:
+    __version__ = _dist_version("ai-economy-sdk")
+except PackageNotFoundError:  # running from a source tree that is not installed
+    __version__ = "0.0.0"
+
+logger = logging.getLogger("ai_economy_sdk")
+logger.addHandler(logging.NullHandler())
 
 __all__ = [
+    "__version__",
     "AIEconomySDK",
     "PaymentGate",
+    "SettleOnSuccessMiddleware",
     "DefaultAvmSigner",
     "ChainReader",
     "PASS_NOTE_PREFIX",
@@ -79,7 +113,55 @@ __all__ = [
     "MAINNET",
     "TESTNET",
     "IDENTITY_HEADERS",
+    "AIEconomyError",
+    "ConfigurationError",
+    "UnknownNetworkError",
+    "AlgodClientRequiredError",
+    "PaymentVerificationError",
+    "PaymentRequiredError",
+    "SettlementError",
+    "ServerSigner",
+    "ChainLookup",
+    "Prices",
+    "ToolPriceFunction",
+    "Transport",
 ]
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _normalize_pricing(
+    name: str, fn: ToolPriceFunction
+) -> Callable[[dict[str, Any], str | None], int]:
+    """Return ``fn`` as a two-argument ``(args, sender)`` function.
+
+    The arity is decided once, here, from the signature. Calling ``fn`` and retrying
+    with fewer arguments on ``TypeError`` would also swallow a ``TypeError`` raised
+    inside ``fn`` and call it again with the wrong arguments.
+    """
+    if not callable(fn):
+        raise ConfigurationError(f"pricing_func for tool {name!r} must be callable")
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn  # type: ignore[return-value]  # no introspectable signature: use (args, sender)
+    try:
+        sig.bind(None, None)
+        return fn  # type: ignore[return-value]
+    except TypeError:
+        pass
+    try:
+        sig.bind(None)
+    except TypeError:
+        raise ConfigurationError(
+            f"pricing_func for tool {name!r} must accept (args, sender) or (args); got {sig}"
+        ) from None
+    one_arg: Callable[[dict[str, Any]], int] = fn  # type: ignore[assignment]
+
+    def two_arg(args: dict[str, Any], sender: str | None) -> int:
+        return one_arg(args)
+
+    return two_arg
 
 
 class AIEconomySDK:
@@ -91,7 +173,7 @@ class AIEconomySDK:
 
     Parameters
     ----------
-    server_signer : Any
+    server_signer : ServerSigner
         Signer instance (e.g., ``DefaultAvmSigner``) providing private keys and
         algod connection to sponsor fees as fee payer.
     network : str
@@ -134,14 +216,14 @@ class AIEconomySDK:
 
     def __init__(
         self,
-        server_signer: Any,
+        server_signer: ServerSigner,
         network: str,
         asset_id: str | int,
         pay_to_address: str,
         indexer_url: str | None = None,
         subscription_asset_id: str | int | None = None,
         name: str = "ai_economy_server",
-    ):
+    ) -> None:
         """Initialize the AIEconomySDK server builder."""
         self.server_signer = server_signer
         network = resolve_network(network, getattr(server_signer, "algod_client", None))
@@ -153,14 +235,14 @@ class AIEconomySDK:
 
         self.mcp = FastMCP(name)
         self.chain = ChainReader(indexer_url=indexer_url) if indexer_url else None
-        self._pricing: dict[str, Callable] = {}
+        self._pricing: dict[str, Callable[[dict[str, Any], str | None], int]] = {}
 
     def add_tool(
         self,
         name: str,
         description: str,
-        pricing_func: Callable,
-    ):
+        pricing_func: ToolPriceFunction,
+    ) -> Callable[[_F], _F]:
         """Decorator — register an MCP tool with dynamic pricing.
 
         Parameters
@@ -169,14 +251,20 @@ class AIEconomySDK:
             Unique tool name recognized by MCP clients.
         description : str
             Human-readable description of tool behavior.
-        pricing_func : Callable
+        pricing_func : ToolPriceFunction
             Pricing function calculating cost in base units. May accept
-            ``(args, sender)`` or ``(args)``.
+            ``(args, sender)`` or ``(args)``; which one is decided from its signature
+            when the tool is registered.
 
         Returns
         -------
         Callable
             Decorator wrapping the target tool function.
+
+        Raises
+        ------
+        ConfigurationError
+            If ``pricing_func`` accepts neither ``(args, sender)`` nor ``(args)``.
 
         Examples
         --------
@@ -190,41 +278,47 @@ class AIEconomySDK:
         ...     return f"Hello, {name}"
         """
 
-        def decorator(func: Callable):
-            self._pricing[name] = pricing_func
+        pricing = _normalize_pricing(name, pricing_func)
+
+        def decorator(func: _F) -> _F:
+            self._pricing[name] = pricing
             self.mcp.tool(name=name, description=description)(func)
             return func
 
         return decorator
 
-    def build_app(self):
+    def build_app(self, transport: Transport | None = None, **wrap_kwargs: Any) -> Any:
         """Build and wrap the FastMCP application with PaymentGate.
 
         Constructs a ``PaymentGate`` instance wired with registered pricing
         functions and wraps the FastMCP application as an ASGI app.
 
+        Parameters
+        ----------
+        transport : {"streamable-http", "http", "sse"}, optional
+            Passed to :meth:`PaymentGate.wrap`. When omitted, the legacy SSE transport is
+            served and a ``FutureWarning`` is emitted (the default will change to
+            ``"streamable-http"``).
+        **wrap_kwargs
+            Further keyword arguments for :meth:`PaymentGate.wrap` (``path``, ...).
+
         Returns
         -------
-        Any
+        starlette.applications.Starlette
             ASGI application ready to serve with uvicorn.
 
         Examples
         --------
         ```python
         # Needs configured server:
-        # app = sdk.build_app()
+        # app = sdk.build_app(transport="streamable-http")
         # uvicorn.run(app, host="127.0.0.1", port=8000)
         ```
         """
 
         def _get_price(tool: str, args: dict[str, Any], sender: str | None) -> int:
-            if tool in self._pricing:
-                fn = self._pricing[tool]
-                try:
-                    return fn(args, sender)
-                except TypeError:
-                    return fn(args)
-            return 0
+            fn = self._pricing.get(tool)
+            return fn(args, sender) if fn is not None else 0
 
         gate = PaymentGate(
             signer=self.server_signer,
@@ -235,7 +329,18 @@ class AIEconomySDK:
             chain=self.chain,
             subscription_asset_id=self.subscription_asset_id,
         )
-        return gate.wrap(self.mcp)
+        if transport is None:
+            # Warn here (not in wrap) so the warning points at the caller of build_app.
+            warnings.warn(
+                "AIEconomySDK.build_app() was called without transport=; it serves the "
+                "legacy SSE transport for compatibility. Pass transport='streamable-http' "
+                "(recommended) or transport='sse' explicitly: the default will change to "
+                "'streamable-http' in a future release.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            transport = "sse"
+        return gate.wrap(self.mcp, transport, **wrap_kwargs)
 
     def has_active_subscription(self, sender_address: str, max_age_days: float = 30.0) -> bool:
         """Check if the sender holds the subscription asset and received it recently.

@@ -53,7 +53,7 @@ def env():
     port = _free_port()
     server = uvicorn.Server(
         uvicorn.Config(
-            gate.wrap(m),
+            gate.wrap(m, transport="sse"),
             host="127.0.0.1",
             port=port,
             log_level="warning",

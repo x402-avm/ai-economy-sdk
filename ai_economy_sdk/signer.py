@@ -4,10 +4,18 @@ Implements the ``AvmSigner`` protocol required by ``x402`` for signing, simulati
 broadcasting, and confirming Algorand transactions and atomic transaction groups.
 """
 
+from __future__ import annotations
+
 import base64
+import warnings
+from typing import Any, cast
 
 from algosdk import account, encoding, transaction
+from algosdk.atomic_transaction_composer import AccountTransactionSigner
+from algosdk.v2client.algod import AlgodClient
 from algosdk.v2client.models import SimulateRequest, SimulateRequestTransactionGroup
+
+from .exceptions import AlgodClientRequiredError, PaymentVerificationError
 
 
 class DefaultAvmSigner:
@@ -26,8 +34,6 @@ class DefaultAvmSigner:
 
     Attributes
     ----------
-    private_key : str
-        The signing key.
     address : str
         The corresponding Algorand public address.
     algod_client : algosdk.v2client.algod.AlgodClient or None
@@ -49,7 +55,7 @@ class DefaultAvmSigner:
     True
     """
 
-    def __init__(self, private_key: str, algod_client=None):
+    def __init__(self, private_key: str, algod_client: AlgodClient | None = None) -> None:
         """Initialize the signer with a private key and optional algod client.
 
         Parameters
@@ -59,11 +65,31 @@ class DefaultAvmSigner:
         algod_client : algosdk.v2client.algod.AlgodClient, optional
             Connected algod client. Default is None.
         """
-        self.private_key = private_key
-        self.address = account.address_from_private_key(private_key)
+        self._private_key = private_key
+        self._account_signer = AccountTransactionSigner(private_key)
+        self.address: str = account.address_from_private_key(private_key)
         self.algod_client = algod_client
 
-    def get_addresses(self):
+    @property
+    def private_key(self) -> str:
+        """The base64 signing key. Deprecated: the key is no longer a public attribute.
+
+        .. deprecated:: 0.5.0
+           Keep your own reference to the key you passed to the constructor.
+        """
+        warnings.warn(
+            "DefaultAvmSigner.private_key is deprecated and will be removed in a future "
+            "release; keep your own reference to the key",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self._private_key
+
+    def __repr__(self) -> str:
+        algod = "connected" if self.algod_client is not None else "none"
+        return f"DefaultAvmSigner(address={self.address!r}, algod_client={algod})"
+
+    def get_addresses(self) -> list[str]:
         """Return the list of public addresses managed by this signer.
 
         Returns
@@ -82,7 +108,9 @@ class DefaultAvmSigner:
         """
         return [self.address]
 
-    def sign_transactions(self, unsigned_txns, indexes):
+    def sign_transactions(
+        self, unsigned_txns: list[bytes], indexes: list[int]
+    ) -> list[bytes | None]:
         """Sign selected transactions in a list.
 
         Parameters
@@ -114,7 +142,7 @@ class DefaultAvmSigner:
         >>> signed[0] is not None
         True
         """
-        signed = []
+        signed: list[bytes | None] = []
         for i, txn_bytes in enumerate(unsigned_txns):
             if i in indexes:
                 signed.append(self._sign_raw(txn_bytes))
@@ -122,7 +150,7 @@ class DefaultAvmSigner:
                 signed.append(None)
         return signed
 
-    def sign_transaction(self, txn_bytes, fee_payer, network):
+    def sign_transaction(self, txn_bytes: bytes, fee_payer: Any, network: str) -> bytes:
         """Sign a single raw transaction.
 
         Parameters
@@ -155,7 +183,9 @@ class DefaultAvmSigner:
         """
         return self._sign_raw(txn_bytes)
 
-    def sign_group(self, group_bytes, fee_payer, indexes, network):
+    def sign_group(
+        self, group_bytes: list[bytes], fee_payer: Any, indexes: list[int], network: str
+    ) -> list[bytes]:
         """Sign specified transactions within an atomic transaction group.
 
         Parameters
@@ -194,7 +224,7 @@ class DefaultAvmSigner:
             signed[i] = self._sign_raw(group_bytes[i])
         return signed
 
-    def simulate_group(self, group_bytes, network):
+    def simulate_group(self, group_bytes: list[bytes], network: str) -> dict[str, Any]:
         """Simulate execution of an atomic transaction group against algod.
 
         Decodes the transactions, constructs a SimulateRequest with
@@ -214,9 +244,10 @@ class DefaultAvmSigner:
 
         Raises
         ------
-        RuntimeError
-            If ``self.algod_client`` is None, or if simulation fails with a
-            failure message returned by algod.
+        AlgodClientRequiredError
+            (a ``RuntimeError``) If ``self.algod_client`` is None.
+        PaymentVerificationError
+            (a ``RuntimeError``) If simulation fails with a failure message from algod.
 
         Examples
         --------
@@ -226,19 +257,19 @@ class DefaultAvmSigner:
         ```
         """
         if self.algod_client is None:
-            raise RuntimeError("algod_client required")
+            raise AlgodClientRequiredError("DefaultAvmSigner needs an algod_client to simulate")
         decoded = [self._decode(b) for b in group_bytes]
         req = SimulateRequest(
             txn_groups=[SimulateRequestTransactionGroup(txns=decoded)],
             allow_empty_signatures=True,
         )
-        result = self.algod_client.simulate_transactions(req)
+        result = cast(dict[str, Any], self.algod_client.simulate_transactions(req))
         txn_groups = result.get("txn-groups", [])
         if txn_groups and txn_groups[0].get("failure-message"):
-            raise RuntimeError(txn_groups[0]["failure-message"])
+            raise PaymentVerificationError(txn_groups[0]["failure-message"])
         return result
 
-    def send_group(self, group_bytes, network):
+    def send_group(self, group_bytes: list[bytes], network: str) -> str:
         """Broadcast a signed atomic transaction group to the network.
 
         Parameters
@@ -255,8 +286,8 @@ class DefaultAvmSigner:
 
         Raises
         ------
-        RuntimeError
-            If ``self.algod_client`` is None.
+        AlgodClientRequiredError
+            (a ``RuntimeError``) If ``self.algod_client`` is None.
 
         Notes
         -----
@@ -270,12 +301,12 @@ class DefaultAvmSigner:
         # txid = signer.send_group(signed_group_bytes, "localnet")
         ```
         """
-        if not self.algod_client:
-            raise RuntimeError("algod_client required")
+        if self.algod_client is None:
+            raise AlgodClientRequiredError("DefaultAvmSigner needs an algod_client to send")
         decoded = [self._decode(b) for b in group_bytes]
         return self.algod_client.send_transactions(decoded)
 
-    def confirm_transaction(self, txid, network, rounds=4):
+    def confirm_transaction(self, txid: str, network: str, rounds: int = 4) -> dict[str, Any]:
         """Wait for an on-chain transaction to be confirmed by algod.
 
         Parameters
@@ -294,8 +325,8 @@ class DefaultAvmSigner:
 
         Raises
         ------
-        RuntimeError
-            If ``self.algod_client`` is None.
+        AlgodClientRequiredError
+            (a ``RuntimeError``) If ``self.algod_client`` is None.
 
         Examples
         --------
@@ -304,13 +335,14 @@ class DefaultAvmSigner:
         # info = signer.confirm_transaction(txid, "localnet")
         ```
         """
-        if not self.algod_client:
-            raise RuntimeError("algod_client required")
+        if self.algod_client is None:
+            raise AlgodClientRequiredError("DefaultAvmSigner needs an algod_client to confirm")
         return transaction.wait_for_confirmation(self.algod_client, txid, rounds)
 
-    def _decode(self, raw_bytes):
+    def _decode(self, raw_bytes: bytes) -> Any:
         return encoding.msgpack_decode(base64.b64encode(raw_bytes).decode())
 
-    def _sign_raw(self, txn_bytes):
+    def _sign_raw(self, txn_bytes: bytes) -> bytes:
         txn = self._decode(txn_bytes)
-        return base64.b64decode(encoding.msgpack_encode(txn.sign(self.private_key)))
+        stxn = self._account_signer.sign_transactions([txn], [0])[0]
+        return base64.b64decode(encoding.msgpack_encode(stxn))

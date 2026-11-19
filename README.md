@@ -6,14 +6,17 @@
 
 Payment-gated Model Context Protocol (MCP) server and client SDK for Algorand.
 
+This project is part of the [x402-avm](https://github.com/x402-avm) GitHub organization. It is not affiliated with GoPlausible's `x402-avm` packages.
+
 `ai-economy-sdk` turns Model Context Protocol (MCP) tools into monetized services on Algorand using the official [x402](https://github.com/x402-foundation/x402) payment standard. On the server side, `PaymentGate` wraps FastMCP applications to enforce per-call micropayments, dynamic rates, and vendor passes with settle-on-success protection. On the client side, `paid_mcp_session` connects to payment-gated servers and automatically settles transactions only when tool execution succeeds.
 
 ## Requirements
 
 - Python 3.10+
 - `x402` >= 2.28, < 3.0
-- `x402-algorand` >= 0.2.0
+- `x402-algorand` >= 0.2.1
 - `fastmcp` >= 3.4, < 4.0
+- `mcp` >= 1.29, < 2.0
 - `py-algorand-sdk` >= 2.6
 
 ## Installation
@@ -48,7 +51,7 @@ gate = PaymentGate(
     prices={"summarize": 5_000},  # 5,000 microALGO per call
 )
 
-app = gate.wrap(mcp)
+app = gate.wrap(mcp, transport="streamable-http")  # MCP endpoint: POST /mcp
 # Run with: uvicorn server:app --port 8000
 ```
 
@@ -61,7 +64,7 @@ from ai_economy_sdk import paid_mcp_session
 
 async def main():
     async with paid_mcp_session(
-        "http://127.0.0.1:8000/sse",
+        "http://127.0.0.1:8000/mcp",
         buyer_private_key,
         "localnet",
     ) as session:
@@ -72,10 +75,34 @@ async def main():
 asyncio.run(main())
 ```
 
+### Transports
+
+`PaymentGate.wrap()` serves either MCP HTTP transport:
+
+| `transport=` | Endpoints | Notes |
+| --- | --- | --- |
+| `"streamable-http"` (alias `"http"`) | `POST /mcp` | Recommended. Stateless by default; pass `stateless_http=False` for MCP sessions. |
+| `"sse"` | `GET /sse`, `POST /messages/` | Legacy HTTP+SSE transport. |
+
+Calling `wrap()` without `transport=` still serves SSE, as in 0.4, and emits a `FutureWarning`: the default will change to `"streamable-http"` in a future release. `paid_mcp_session` picks Streamable HTTP for URLs ending in `/mcp` and SSE otherwise; pass `transport=` to choose explicitly.
+
+The gate inspects every HTTP `POST` for a JSON-RPC `tools/call`, whatever its path. A priced tool call that reaches the FastMCP server any other way (for example over a transport the gate does not wrap) is refused with `PaymentRequiredError`. To build the HTTP app yourself, install both layers:
+
+```python
+from ai_economy_sdk import SettleOnSuccessMiddleware
+
+mcp.add_middleware(SettleOnSuccessMiddleware(gate))
+app = mcp.http_app(transport="http", middleware=gate.middleware())
+```
+
+### Errors and logging
+
+Every exception the SDK raises deliberately subclasses `ai_economy_sdk.AIEconomyError` and also the built-in type raised before 0.5.0 (`ConfigurationError` is a `ValueError`, `SettlementError` and `PaymentRequiredError` are FastMCP `ToolError`s, and so on). Payment refusals, settlement failures and failed chain lookups are logged to the `ai_economy_sdk` logger.
+
 ## Key Capabilities
 
 - **Settle-on-Success**: Payments are verified before tool execution, but committed on-chain only after the tool completes successfully. If a tool raises an error, the payment is never submitted and the buyer is not charged.
-- **Identity Verification**: Built-in `X-Identity-Txn` cryptographic proofs verify client account ownership without on-chain execution or transaction fees.
+- **Identity Verification**: Built-in `X-Identity-Txn` cryptographic proofs (`sign_identity_txn`) verify client account ownership without on-chain execution or transaction fees. The legacy `sign_identity` headers are still accepted but the function is deprecated.
 - **Spend Limits & Controls**: Direct integration with official `x402Client` spend controls allows setting per-payment caps or whitelisting custom ASAs.
 - **Vendor Passes & Subscriptions**: Support for period-based access passes and subscription ASA tokens.
 - **Replay Protection**: Built-in replay prevention using memory or SQLite stores across single-process and multi-worker deployments.
@@ -101,7 +128,7 @@ Run tests across test tiers:
 
 ```bash
 # Tier 1: Offline unit tests (default)
-pytest
+pytest --cov=ai_economy_sdk
 
 # Tier 2: AlgoKit LocalNet integration tests (requires `algokit localnet start`)
 LOCALNET=1 pytest
@@ -119,4 +146,4 @@ ruff format --check .
 
 ## License
 
-MIT License. Copyright (c) AI Economy Team.
+MIT License. Copyright (c) 2026 x402-avm contributors.

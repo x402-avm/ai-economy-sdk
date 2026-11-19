@@ -15,12 +15,18 @@ reset, so ``"localnet"`` is resolved by asking its algod.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any
 
 import x402_algorand.constants as c
 import x402_algorand.utils as u
+from algosdk.error import AlgodHTTPError
+
+from .exceptions import ConfigurationError, UnknownNetworkError
+
+logger = logging.getLogger("ai_economy_sdk")
 
 LOCALNET_TOKEN = "a" * 64
 
@@ -113,7 +119,7 @@ def is_public(network: str) -> bool:
         return _ALIASES[key] in _PUBLIC
     try:
         return u.normalize_network(network.strip()) in _PUBLIC
-    except Exception:
+    except ValueError:
         return False
 
 
@@ -141,8 +147,8 @@ def resolve_network(network: str, algod_client: Any = None) -> str:
 
     Raises
     ------
-    ValueError
-        If the network name cannot be resolved or is invalid.
+    UnknownNetworkError
+        (a ``ValueError``) If the network name cannot be resolved or is invalid.
 
     See Also
     --------
@@ -160,7 +166,7 @@ def resolve_network(network: str, algod_client: Any = None) -> str:
     True
     """
     if not isinstance(network, str) or not network.strip():
-        raise ValueError(
+        raise UnknownNetworkError(
             "network must be a non-empty string such as 'mainnet', 'testnet', 'localnet' or 'algorand:<genesis hash>'"
         )
     name = network.strip()
@@ -183,11 +189,13 @@ def resolve_network(network: str, algod_client: Any = None) -> str:
                 sp = client.suggested_params()
                 if u.caip2_from_genesis_hash(sp.gh) == norm:
                     u.register_network(sp.gh, sp.gen)
-            except Exception:
-                pass
+            except (AlgodHTTPError, OSError, ValueError):
+                # No local algod (or a different one): the id stays unregistered and
+                # x402 reports it as unsupported when it is used.
+                logger.debug("could not register %s from the local algod", norm, exc_info=True)
         return norm
     except ValueError:
-        raise ValueError(
+        raise UnknownNetworkError(
             f"unknown network {network!r}: use 'mainnet', 'testnet', 'localnet' or 'algorand:<genesis hash>'"
         ) from None
 
@@ -227,7 +235,7 @@ def endpoints_for(network: str) -> Endpoints:
     else:
         try:
             caip = u.normalize_network(network.strip())
-        except Exception:
+        except ValueError:
             caip = network
     return _PUBLIC.get(caip, LOCALNET)
 
@@ -254,9 +262,11 @@ def register_network(
 
     Raises
     ------
-    ValueError
-        If ``network`` is not a string, or if an unknown short CAIP-2 ID is passed
-        without providing the full genesis hash or Algod client.
+    ConfigurationError
+        (a ``ValueError``) If ``network`` is not a string.
+    UnknownNetworkError
+        (a ``ValueError``) If an unknown short CAIP-2 ID is passed without the full
+        genesis hash; use ``network_from_algod`` instead.
 
     See Also
     --------
@@ -268,7 +278,7 @@ def register_network(
     >>> register_network("mainnet")
     """
     if not isinstance(network, str):
-        raise ValueError("network must be a string")
+        raise ConfigurationError("network must be a string")
     net = network.strip()
     # If network is a legacy long id or bare 44-char genesis hash
     raw_hash = net[len("algorand:") :] if net.startswith("algorand:") else net
@@ -284,7 +294,7 @@ def register_network(
         return
 
     # Short unknown id:
-    raise ValueError("pass the genesis hash or use network_from_algod")
+    raise UnknownNetworkError("pass the genesis hash or use network_from_algod")
 
 
 def network_from_algod(algod_client: Any) -> str:
@@ -356,7 +366,7 @@ def usdc_asset_id(network: str) -> int | None:
     else:
         try:
             caip = u.normalize_network(network.strip())
-        except Exception:
+        except ValueError:
             caip = network
     return {
         c.ALGORAND_MAINNET_CAIP2: c.USDC_MAINNET_ASA_ID,

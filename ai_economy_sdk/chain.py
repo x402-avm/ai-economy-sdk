@@ -7,13 +7,28 @@ Queries transaction history and asset holdings to support:
 """
 
 import base64
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Any
 
 import algosdk.v2client.indexer
+from algosdk.error import AlgodHTTPError, IndexerHTTPError
+
+logger = logging.getLogger("ai_economy_sdk")
 
 PASS_NOTE_PREFIX = "x402-pass:"
+
+#: Errors an on-chain lookup can raise when a node is unreachable or answers unexpectedly:
+#: HTTP errors from algod/indexer, connection errors (``urllib.error.URLError`` is an
+#: ``OSError``), and malformed responses.
+LOOKUP_ERRORS: tuple[type[BaseException], ...] = (
+    IndexerHTTPError,
+    AlgodHTTPError,
+    OSError,
+    ValueError,
+    KeyError,
+)
 
 
 class ChainReader:
@@ -56,7 +71,7 @@ class ChainReader:
         indexer_url: str = "http://localhost:8980",
         indexer_token: str = "",
         indexer: Any = None,
-    ):
+    ) -> None:
         """Initialize the ChainReader instance.
 
         Parameters
@@ -194,7 +209,12 @@ class ChainReader:
                 if not next_page:
                     break
             return total
-        except Exception:
+        except LOOKUP_ERRORS:
+            logger.warning(
+                "past_usage lookup for %s failed; reporting 0 (no bulk discount)",
+                address,
+                exc_info=True,
+            )
             return 0
 
     def has_active_subscription(
@@ -289,7 +309,12 @@ class ChainReader:
                 return False
 
             return (curr_now - newest_round_time) / 86400.0 <= max_age_days
-        except Exception:
+        except LOOKUP_ERRORS:
+            logger.warning(
+                "subscription lookup for %s failed; treating as not subscribed",
+                address,
+                exc_info=True,
+            )
             return False
 
     def active_passes(
@@ -376,7 +401,8 @@ class ChainReader:
                         continue
                     try:
                         note = base64.b64decode(tx.get("note", "")).decode()
-                    except Exception:
+                    except ValueError:  # binascii.Error and UnicodeDecodeError
+                        logger.debug("skipping txn %s: undecodable note", tx.get("id"))
                         continue
                     if not note.startswith(PASS_NOTE_PREFIX):
                         continue
@@ -399,7 +425,10 @@ class ChainReader:
                 if not next_page:
                     break
             return sorted(found.values(), key=lambda x: x["round_time"])
-        except Exception:
+        except LOOKUP_ERRORS:
+            logger.warning(
+                "pass lookup for %s failed; treating as no active pass", address, exc_info=True
+            )
             return []
 
     def has_pass(

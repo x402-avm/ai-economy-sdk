@@ -1,26 +1,40 @@
 """Paid MCP client session using x402 on Algorand.
 
-Wraps ``mcp.client.sse.sse_client`` with an automatic ``x402HttpxClient`` payment handler
-and optional Ed25519 identity headers. When an MCP tool call returns HTTP 402 Payment
-Required, the client parses the requirement, signs an atomic Algorand payment transaction
-(or 2-txn fee-payer group), and retries the request transparently with the signed payment.
+Opens an MCP client session over Streamable HTTP or the legacy SSE transport with an
+``x402HttpxClient`` and optional identity headers. When an MCP tool call returns HTTP
+402 Payment Required, the client parses the requirement, signs an atomic Algorand payment
+transaction (or 2-txn fee-payer group), and retries the request with the signed payment.
 """
+
+from __future__ import annotations
 
 import contextlib
 from collections.abc import AsyncGenerator
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import httpx
 import mcp.client.sse
 from algosdk.v2client import algod
 from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
 from x402 import x402Client
 from x402.http.clients.httpx import x402HttpxClient
 from x402_algorand.exact.register import register_exact_avm_client
 
-from .identity import sign_identity
+from .exceptions import ConfigurationError
+from .identity import _sign_legacy_identity
 from .network import endpoints_for, resolve_network
 from .signer import DefaultAvmSigner
+from .types import SpendControlsArg
+
+ClientTransport = Literal["streamable-http", "sse"]
+
+
+def _infer_transport(url: str) -> ClientTransport:
+    """Streamable HTTP for URLs whose path ends in ``/mcp``; SSE otherwise (the 0.4 behaviour)."""
+    path = urlsplit(url).path.rstrip("/")
+    return "streamable-http" if path.endswith("/mcp") else "sse"
 
 
 @contextlib.asynccontextmanager
@@ -32,19 +46,23 @@ async def paid_mcp_session(
     algod_token: str | None = None,
     identity: bool = True,
     timeout: float = 30.0,
-    spend_controls: dict | Literal[False] | None = None,
+    spend_controls: SpendControlsArg = None,
+    *,
+    transport: ClientTransport | None = None,
 ) -> AsyncGenerator[ClientSession, None]:
     """Open an MCP session that pays for tool calls with x402 on Algorand.
 
-    Connects to a remote SSE-based Model Context Protocol server, initializing
-    a ClientSession configured with an x402-aware HTTP client. Outgoing requests
-    automatically carry identity headers (if enabled) and auto-sign 402 payment
-    challenges for exact Algorand scheme payments.
+    Connects to a remote Model Context Protocol server over Streamable HTTP or the
+    legacy SSE transport, initializing a ClientSession configured with an x402-aware
+    HTTP client. Outgoing requests automatically carry identity headers (if enabled)
+    and auto-sign 402 payment challenges for exact Algorand scheme payments.
 
     Parameters
     ----------
     sse_url : str
-        URL of the SSE endpoint on the MCP server (e.g. ``"http://localhost:8000/sse"``).
+        URL of the server's MCP endpoint: ``"http://localhost:8000/mcp"`` for Streamable
+        HTTP or ``"http://localhost:8000/sse"`` for SSE. (The parameter keeps its 0.4
+        name for compatibility; it accepts either kind of URL.)
     private_key : str
         Base64-encoded 32-byte Algorand private key used by the buyer to sign payments
         and identity proofs.
@@ -72,6 +90,9 @@ async def paid_mcp_session(
           ``{"allowed_assets": True}`` allows any asset while keeping default payment cap, or
           ``{"allowed_assets": [{"network": network, "asset": "12345", "max_amount_per_payment": "5000000"}]}``
           whitelists a specific ASA.
+    transport : {"streamable-http", "sse"}, optional
+        MCP transport to use. When omitted, Streamable HTTP is used if the URL path ends
+        in ``/mcp`` and SSE otherwise, which keeps 0.4 behaviour for SSE URLs.
 
     Yields
     ------
@@ -91,6 +112,11 @@ async def paid_mcp_session(
     PaymentGate : Server-side payment middleware.
     AIEconomySDK : High-level server framework.
 
+    Raises
+    ------
+    ConfigurationError
+        If ``transport`` is not ``"streamable-http"`` or ``"sse"``.
+
     Examples
     --------
     ```python
@@ -100,7 +126,7 @@ async def paid_mcp_session(
 
     async def run():
         async with paid_mcp_session(
-            sse_url="http://localhost:8000/sse",
+            "http://localhost:8000/mcp",
             private_key=buyer_pk,
             network="localnet",
         ) as session:
@@ -110,6 +136,12 @@ async def paid_mcp_session(
     asyncio.run(run())
     ```
     """
+    if transport is None:
+        transport = _infer_transport(sse_url)
+    elif transport not in ("streamable-http", "sse"):
+        raise ConfigurationError(
+            f"unsupported transport {transport!r}; use 'streamable-http' or 'sse'"
+        )
     default_timeout = timeout
     ep = endpoints_for(network)
     if algod_url is None:
@@ -132,7 +164,7 @@ async def paid_mcp_session(
 
     async def add_identity_headers(request: httpx.Request) -> None:
         if identity:
-            for k, v in sign_identity(private_key).items():
+            for k, v in _sign_legacy_identity(private_key).items():
                 request.headers[k] = v
 
     def factory(
@@ -155,6 +187,14 @@ async def paid_mcp_session(
             auth=auth,
             event_hooks=hooks,
         )
+
+    if transport == "streamable-http":
+        async with factory() as http_client:
+            async with streamable_http_client(sse_url, http_client=http_client) as (r, w, _):
+                async with ClientSession(r, w) as s:
+                    await s.initialize()
+                    yield s
+        return
 
     async with mcp.client.sse.sse_client(sse_url, httpx_client_factory=factory) as (r, w):
         async with ClientSession(r, w) as s:

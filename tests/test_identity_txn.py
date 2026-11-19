@@ -228,7 +228,7 @@ def test_verify_identity_wrapper_supports_identity_txn():
     assert res == addr
 
     # Legacy header fallback
-    from ai_economy_sdk.identity import sign_identity
+    from ai_economy_sdk.identity import _sign_legacy_identity as sign_identity
 
     legacy_headers = sign_identity(sk)
     res_legacy = verify_identity(legacy_headers, genesis_hash_b64=GENESIS_HASH)
@@ -261,3 +261,25 @@ def test_localnet_algod_rejects_identity_txn_fee_too_low():
         or "TransactionPool.Remember" in err_text
         or "fee" in err_text.lower()
     )
+
+
+def test_mutated_proofs_never_raise():
+    """verify_identity_txn() gets untrusted input: corrupted proofs return None, never raise."""
+    import base64
+    import random
+
+    sk, addr = account.generate_account()
+    raw = base64.b64decode(sign_identity_txn(sk, GENESIS_HASH, ts=1700000000)["X-Identity-Txn"])
+    rng = random.Random(1234)
+    for _ in range(1500):
+        b = bytearray(raw)
+        for _ in range(rng.randint(1, 4)):
+            op = rng.random()
+            if op < 0.5:
+                b[rng.randrange(len(b))] = rng.randrange(256)
+            elif op < 0.75 and len(b) > 1:
+                del b[rng.randrange(len(b))]
+            else:
+                b.insert(rng.randrange(len(b) + 1), rng.randrange(256))
+        out = verify_identity_txn(base64.b64encode(bytes(b)).decode(), GENESIS_HASH, now=1700000000)
+        assert out in (None, addr)

@@ -1,4 +1,6 @@
-"""Contract: ai_economy_sdk.gate.PaymentGate - x402 payment gate in front of ANY FastMCP server (SSE transport).
+"""Contract: ai_economy_sdk.gate.PaymentGate - x402 payment gate in front of ANY FastMCP server.
+
+Every request-level test runs on both HTTP transports (Streamable HTTP and SSE).
 
 Offline: no blockchain needed. A request is only *priced* here; settlement is covered by tests/test_e2e_localnet.py.
 """
@@ -11,13 +13,20 @@ from algosdk import account
 from fastmcp import FastMCP
 from starlette.testclient import TestClient
 
-from ai_economy_sdk import MAINNET, DefaultAvmSigner, PaymentGate
-from ai_economy_sdk.identity import sign_identity
+from ai_economy_sdk import MAINNET, ConfigurationError, DefaultAvmSigner, PaymentGate
+from ai_economy_sdk.identity import _sign_legacy_identity as sign_identity
 
 NET = MAINNET
 SPK, PAY_TO = account.generate_account()
 UPK, USER = account.generate_account()
 SESSION = "/messages/?session_id=0123456789abcdef0123456789abcdef"
+PATHS = {"sse": SESSION, "streamable-http": "/mcp"}
+ACCEPT = {"accept": "application/json, text/event-stream"}
+
+
+@pytest.fixture(params=["streamable-http", "sse"])
+def transport(request):
+    return request.param
 
 
 def call(name, args=None, method="tools/call"):
@@ -67,13 +76,17 @@ def required(resp):
     return json.loads(base64.b64decode(hdr))["accepts"][0]
 
 
-def post(app, body, headers=None):
+def post(app, body, headers=None, transport="sse"):
     with TestClient(app) as c:
-        return c.post(SESSION, json=body, headers=headers or {})
+        return c.post(PATHS[transport], json=body, headers={**ACCEPT, **(headers or {})})
 
 
-def test_paid_tool_returns_402_with_exact_requirements():
-    r = post(gate().wrap(make_mcp()), call("echo", {"text": "hi"}))
+def wrap(g, transport):
+    return g.wrap(make_mcp(), transport=transport)
+
+
+def test_paid_tool_returns_402_with_exact_requirements(transport):
+    r = post(wrap(gate(), transport), call("echo", {"text": "hi"}), transport=transport)
     assert r.status_code == 402
     req = required(r)
     assert str(req["amount"]) == "1000"
@@ -91,14 +104,71 @@ def test_paid_tool_returns_402_with_exact_requirements():
         call("not_listed_tool"),
     ],
 )
-def test_free_or_non_tool_requests_pass_through(body):
-    assert post(gate().wrap(make_mcp()), body).status_code != 402
+def test_free_or_non_tool_requests_pass_through(body, transport):
+    assert post(wrap(gate(), transport), body, transport=transport).status_code != 402
 
 
 def test_sse_endpoint_not_gated():
-    app = gate().wrap(make_mcp())
+    app = wrap(gate(), "sse")
     paths = {getattr(r, "path", None) for r in app.routes}
     assert "/sse" in paths
+
+
+def test_fee_floor_raises_configuration_error_which_is_a_value_error():
+    with pytest.raises(ConfigurationError):
+        gate(prices={"echo": 1500}, allow_loss=False)
+    with pytest.raises(ValueError):
+        gate(prices={}, default_price=10, allow_loss=False)
+
+
+def test_subscription_issuer_requires_issuer_aware_chain():
+    with pytest.raises(ConfigurationError, match="issuer"):
+        gate(chain=FakeChain(sub=True), subscription_asset_id=77, subscription_issuer=PAY_TO)
+
+
+class IssuerChain(FakeChain):
+    def has_active_subscription(self, address, asset_id, max_age_days=30.0, now=None, issuer=None):
+        self.sub_calls.append((address, asset_id, issuer))
+        return self.sub
+
+
+def test_subscription_issuer_is_passed_and_a_type_error_inside_is_not_retried():
+    chain = IssuerChain(sub=True)
+    g = gate(chain=chain, subscription_asset_id=77, subscription_issuer=PAY_TO)
+    assert g.price_for("echo", {}, USER) == 0
+    assert chain.sub_calls == [(USER, 77, PAY_TO)]
+
+    class Broken(IssuerChain):
+        def has_active_subscription(self, *a, **kw):
+            raise TypeError("bug inside the lookup")
+
+    g = gate(chain=Broken(), subscription_asset_id=77, subscription_issuer=PAY_TO)
+    with pytest.raises(TypeError, match="bug inside"):
+        g.price_for("echo", {}, USER)
+
+
+class DownChain(FakeChain):
+    def has_active_subscription(self, *a, **kw):
+        raise OSError("indexer unreachable")
+
+    def has_pass(self, *a, **kw):
+        raise OSError("indexer unreachable")
+
+    def past_usage(self, *a, **kw):
+        raise OSError("indexer unreachable")
+
+
+def test_lookup_failures_charge_full_price_and_log(caplog):
+    g = gate(
+        chain=DownChain(),
+        subscription_asset_id=77,
+        pass_scopes={"all": 10_000},
+        bulk_threshold=1,
+    )
+    with caplog.at_level("WARNING", logger="ai_economy_sdk"):
+        assert g.price_for("echo", {}, USER) == 1000
+    for what in ("pass lookup", "subscription lookup", "usage lookup"):
+        assert what in caplog.text
 
 
 def test_callable_pricing():
@@ -107,30 +177,46 @@ def test_callable_pricing():
     )
     assert g.price_for("echo", {"text": "x"}, None) == 42
     assert g.price_for("echo", {"text": "y"}, None) == 7
-    assert str(required(post(g.wrap(make_mcp()), call("echo", {"text": "x"})))["amount"]) == "42"
+    r = post(wrap(g, "streamable-http"), call("echo", {"text": "x"}), transport="streamable-http")
+    assert str(required(r)["amount"]) == "42"
 
 
-def test_verified_subscriber_is_free():
+def test_verified_subscriber_is_free(transport):
     chain = FakeChain(sub=True)
     g = gate(chain=chain, subscription_asset_id=77)
-    r = post(g.wrap(make_mcp()), call("echo", {"text": "hi"}), headers=sign_identity(UPK))
+    r = post(
+        wrap(g, transport),
+        call("echo", {"text": "hi"}),
+        headers=sign_identity(UPK),
+        transport=transport,
+    )
     assert r.status_code != 402
     assert chain.sub_calls and chain.sub_calls[-1] == (USER, 77)
 
 
-def test_spoofed_subscriber_header_still_pays():
+def test_spoofed_subscriber_header_still_pays(transport):
     chain = FakeChain(sub=True)
     g = gate(chain=chain, subscription_asset_id=77)
-    r = post(g.wrap(make_mcp()), call("echo", {"text": "hi"}), headers={"x-sender-address": USER})
+    r = post(
+        wrap(g, transport),
+        call("echo", {"text": "hi"}),
+        headers={"x-sender-address": USER},
+        transport=transport,
+    )
     assert r.status_code == 402
     assert chain.sub_calls == []  # unverified identity must never reach the chain lookups
 
 
-def test_bulk_discount_for_verified_power_user():
+def test_bulk_discount_for_verified_power_user(transport):
     g = gate(chain=FakeChain(usage=60_000), bulk_threshold=50_000, bulk_discount=0.5)
     assert g.price_for("echo", {}, USER) == 500
     assert g.price_for("echo", {}, None) == 1000
-    r = post(g.wrap(make_mcp()), call("echo", {"text": "hi"}), headers=sign_identity(UPK))
+    r = post(
+        wrap(g, transport),
+        call("echo", {"text": "hi"}),
+        headers=sign_identity(UPK),
+        transport=transport,
+    )
     assert str(required(r)["amount"]) == "500"
 
 

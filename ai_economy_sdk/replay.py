@@ -7,10 +7,13 @@ on chain), or released (on failure or tool error).
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 import time
 from pathlib import Path
+
+logger = logging.getLogger("ai_economy_sdk")
 
 
 class ReplayStore:
@@ -199,5 +202,5 @@ class ReplayStore:
             if self.path is not None and hasattr(self, "_conn"):
                 try:
                     self._conn.close()
-                except Exception:
-                    pass
+                except sqlite3.Error:
+                    logger.warning("closing replay store %s failed", self.path, exc_info=True)

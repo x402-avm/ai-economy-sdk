@@ -93,7 +93,9 @@ def offline_server():
 
     port = _free_port()
     server = uvicorn.Server(
-        uvicorn.Config(gate.wrap(m), host="127.0.0.1", port=port, log_level="error")
+        uvicorn.Config(
+            gate.wrap(m, transport="sse"), host="127.0.0.1", port=port, log_level="error"
+        )
     )
     t = threading.Thread(target=server.run, daemon=True)
     t.start()
@@ -228,7 +230,9 @@ def test_localnet_failing_tool_leaves_balances_unchanged():
 
     port = _free_port()
     server = uvicorn.Server(
-        uvicorn.Config(gate.wrap(m), host="127.0.0.1", port=port, log_level="warning")
+        uvicorn.Config(
+            gate.wrap(m, transport="sse"), host="127.0.0.1", port=port, log_level="warning"
+        )
     )
     t = threading.Thread(target=server.run, daemon=True)
     t.start()
