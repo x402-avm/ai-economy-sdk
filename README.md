@@ -23,18 +23,20 @@ from ai_economy_sdk import DefaultAvmSigner, PaymentGate
 
 mcp = FastMCP("Summarizer")
 
+
 @mcp.tool()
 def summarize(text: str) -> str:
     return text[:200]
+
 
 algod = AlgodClient("", "https://testnet-api.algonode.cloud")
 gate = PaymentGate(
     signer=DefaultAvmSigner(server_private_key, algod_client=algod),  # pays the network fee
     network="testnet",
-    pay_to=my_address,                 # where the money goes
-    prices={"summarize": 5_000},       # 5,000 microALGO = 0.005 ALGO per call
+    pay_to=my_address,  # where the money goes
+    prices={"summarize": 5_000},  # 5,000 microALGO = 0.005 ALGO per call
 )
-app = gate.wrap(mcp, transport="streamable-http")   # run with: uvicorn server:app
+app = gate.wrap(mcp, transport="streamable-http")  # run with: uvicorn server:app
 ```
 
 An unpaid call to `summarize` gets `402 Payment Required` with the price. A paid call runs the tool, and the payment goes on chain only if the tool returns a result.
