@@ -4,146 +4,79 @@
 [![PyPI version](https://img.shields.io/pypi/v/ai-economy-sdk.svg)](https://pypi.org/project/ai-economy-sdk/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Payment-gated Model Context Protocol (MCP) server and client SDK for Algorand.
+**Sell your MCP tools per call, and let your agents pay for other people's, in ALGO or USDC on Algorand.**
 
-This project is part of the [x402-avm](https://github.com/x402-avm) GitHub organization. It is not affiliated with GoPlausible's `x402-avm` packages.
+Wrap a FastMCP server, put a price on each tool, and any MCP client with an Algorand wallet can pay for it. Callers don't need an account or an API key. The money goes straight to your address, and the buyer is charged only if the tool succeeds. On the other side, a few lines give your Python agent a wallet it can pay tools with, inside limits you set.
 
-`ai-economy-sdk` turns Model Context Protocol (MCP) tools into monetized services on Algorand using the official [x402](https://github.com/x402-foundation/x402) payment standard. On the server side, `PaymentGate` wraps FastMCP applications to enforce per-call micropayments, dynamic rates, and vendor passes with settle-on-success protection. On the client side, `paid_mcp_session` connects to payment-gated servers and automatically settles transactions only when tool execution succeeds.
-
-## Requirements
-
-- Python 3.10+
-- `x402` >= 2.28, < 3.0
-- `x402-algorand` >= 0.2.1
-- `fastmcp` >= 3.4, < 4.0
-- `mcp` >= 1.29, < 2.0
-- `py-algorand-sdk` >= 2.6
-
-## Installation
+Part of [x402-avm](https://github.com/x402-avm/x402-avm). Built on the open [x402](https://www.x402.org) standard. **[Documentation](https://x402-avm.github.io/build/sell-mcp-tools)**
 
 ```bash
 pip install ai-economy-sdk
 ```
 
-Installing `ai-economy-sdk` automatically installs `x402-algorand` and the official `x402` package.
-
-## Quickstart
-
-### 1. Server: Monetize FastMCP Tools
+## Sell a tool
 
 ```python
+from algosdk.v2client.algod import AlgodClient
 from fastmcp import FastMCP
-from ai_economy_sdk import PaymentGate, DefaultAvmSigner
+from ai_economy_sdk import DefaultAvmSigner, PaymentGate
 
-mcp = FastMCP("paid-service")
-
+mcp = FastMCP("Summarizer")
 
 @mcp.tool()
 def summarize(text: str) -> str:
-    return f"Summary: {text[:50]}..."
+    return text[:200]
 
-
+algod = AlgodClient("", "https://testnet-api.algonode.cloud")
 gate = PaymentGate(
-    signer=DefaultAvmSigner(server_private_key),
-    network="localnet",
-    pay_to=server_address,
-    asset_id=0,  # Native ALGO (or ASA ID such as USDC)
-    prices={"summarize": 5_000},  # 5,000 microALGO per call
+    signer=DefaultAvmSigner(server_private_key, algod_client=algod),  # pays the network fee
+    network="testnet",
+    pay_to=my_address,                 # where the money goes
+    prices={"summarize": 5_000},       # 5,000 microALGO = 0.005 ALGO per call
 )
-
-app = gate.wrap(mcp, transport="streamable-http")  # MCP endpoint: POST /mcp
-# Run with: uvicorn server:app --port 8000
+app = gate.wrap(mcp, transport="streamable-http")   # run with: uvicorn server:app
 ```
 
-### 2. Client: Invoke Paid Tools
+An unpaid call to `summarize` gets `402 Payment Required` with the price. A paid call runs the tool, and the payment goes on chain only if the tool returns a result.
+
+## Pay for a tool
 
 ```python
-import asyncio
 from ai_economy_sdk import paid_mcp_session
 
-
-async def main():
-    async with paid_mcp_session(
-        "http://127.0.0.1:8000/mcp",
-        buyer_private_key,
-        "localnet",
-    ) as session:
-        result = await session.call_tool("summarize", {"text": "Hello Algorand x402"})
-        print(result.content[0].text)
-
-
-asyncio.run(main())
+async with paid_mcp_session("https://example.com/mcp", wallet_private_key, "testnet") as session:
+    result = await session.call_tool("summarize", {"text": article})
 ```
 
-### Transports
+The session pays every `402` on its own. It refuses any payment over 1 ALGO or 1 USDC per call, or in an asset it doesn't know, unless you pass different `spend_controls`. A refused payment raises `SpendLimitExceededError`, and nothing is signed.
 
-`PaymentGate.wrap()` serves either MCP HTTP transport:
+## What else it does
 
-| `transport=` | Endpoints | Notes |
-| --- | --- | --- |
-| `"streamable-http"` (alias `"http"`) | `POST /mcp` | Recommended. Stateless by default; pass `stateless_http=False` for MCP sessions. |
-| `"sse"` | `GET /sse`, `POST /messages/` | Legacy HTTP+SSE transport. |
+- **Pricing your way:** fixed prices per tool, prices computed from the arguments or the caller, and USDC or any other Algorand asset. → [Pricing and passes](https://x402-avm.github.io/build/pricing)
+- **Passes and subscriptions:** let holders of a pass token call tools without paying each time.
+- **Caller identity:** prove who is calling with a signed proof that never touches the chain. → [Identity](https://x402-avm.github.io/build/identity)
+- **Replay protection:** one payment can't be used twice, including across workers (SQLite store). → [Security](https://x402-avm.github.io/production/security)
+- **Both MCP transports:** Streamable HTTP (`/mcp`, recommended) and the older SSE.
+- **Typed errors:** every error is a subclass of `AIEconomyError`.
 
-Calling `wrap()` without `transport=` still serves SSE, as in 0.4, and emits a `FutureWarning`: the default will change to `"streamable-http"` in a future release. `paid_mcp_session` picks Streamable HTTP for URLs ending in `/mcp` and SSE otherwise; pass `transport=` to choose explicitly.
+Try it on your machine with test money in five minutes: [Quickstart](https://x402-avm.github.io/quickstart). The full API is in the [reference](https://x402-avm.github.io/reference/python/ai-economy-sdk/index).
 
-The gate inspects every HTTP `POST` for a JSON-RPC `tools/call`, whatever its path. A priced tool call that reaches the FastMCP server any other way (for example over a transport the gate does not wrap) is refused with `PaymentRequiredError`. To build the HTTP app yourself, install both layers:
+## Related packages
 
-```python
-from ai_economy_sdk import SettleOnSuccessMiddleware
-
-mcp.add_middleware(SettleOnSuccessMiddleware(gate))
-app = mcp.http_app(transport="http", middleware=gate.middleware())
-```
-
-### Errors and logging
-
-Every exception the SDK raises deliberately subclasses `ai_economy_sdk.AIEconomyError` and also the built-in type raised before 0.5.0 (`ConfigurationError` is a `ValueError`, `SettlementError` and `PaymentRequiredError` are FastMCP `ToolError`s, and so on). Payment refusals, settlement failures and failed chain lookups are logged to the `ai_economy_sdk` logger.
-
-## Key Capabilities
-
-- **Settle-on-Success**: Payments are verified before tool execution, but committed on-chain only after the tool completes successfully. If a tool raises an error, the payment is never submitted and the buyer is not charged.
-- **Identity Verification**: Built-in `X-Identity-Txn` cryptographic proofs (`sign_identity_txn`) verify client account ownership without on-chain execution or transaction fees. The legacy `sign_identity` headers are still accepted but the function is deprecated.
-- **Spend Limits & Controls**: Direct integration with official `x402Client` spend controls allows setting per-payment caps or whitelisting custom ASAs.
-- **Vendor Passes & Subscriptions**: Support for period-based access passes and subscription ASA tokens.
-- **Replay Protection**: Built-in replay prevention using memory or SQLite stores across single-process and multi-worker deployments.
-
-## Ecosystem
-
-- [Documentation](https://x402-avm.github.io): Architecture guides, tutorials, and API references.
-- [x402-avm/examples](https://github.com/x402-avm/examples): Runnable examples for LocalNet, TestNet, and MainNet.
-- [x402-algorand](https://github.com/x402-avm/x402-algorand): Algorand exact payment scheme plugin for official `x402`.
-- [x402-avm-js](https://github.com/x402-avm/x402-avm-js): TypeScript client for web browsers and Node.js.
+`ai-economy-sdk` installs [`x402-algorand`](https://github.com/x402-avm/x402-algorand), the Algorand plugin for the official x402 SDK, which you can also use on its own for HTTP APIs. To pay from a browser or Node.js, use [`x402-avm-js`](https://github.com/x402-avm/x402-avm-js). Supports Python 3.10 to 3.14.
 
 ## Development
 
-Clone the repository and install development dependencies:
-
 ```bash
-git clone https://github.com/x402-avm/ai-economy-sdk.git
-cd ai-economy-sdk
-uv pip install -e ".[dev]"
+git clone https://github.com/x402-avm/ai-economy-sdk.git && cd ai-economy-sdk
+pip install -e ".[dev]"
+pytest                    # offline tests
+LOCALNET=1 pytest         # also against AlgoKit LocalNet (algokit localnet start)
+ruff check . && ruff format --check .
 ```
 
-Run tests across test tiers:
+See [CONTRIBUTING](https://github.com/x402-avm/.github/blob/main/CONTRIBUTING.md). Report security problems privately, following the [security policy](https://github.com/x402-avm/.github/blob/main/SECURITY.md).
 
-```bash
-# Tier 1: Offline unit tests (default)
-pytest --cov=ai_economy_sdk
+## Licence
 
-# Tier 2: AlgoKit LocalNet integration tests (requires `algokit localnet start`)
-LOCALNET=1 pytest
-
-# Tier 3: Public network simulations (TestNet/MainNet, simulate only)
-PUBLIC_NETS=1 pytest
-```
-
-Check formatting and linting:
-
-```bash
-ruff check .
-ruff format --check .
-```
-
-## License
-
-MIT License. Copyright (c) 2026 x402-avm contributors.
+MIT. Copyright (c) 2026 x402-avm contributors. x402-avm is not affiliated with GoPlausible's x402-avm packages.
